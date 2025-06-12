@@ -1,0 +1,2 @@
+# Enable HTTPS support in HTTP server
+CONFIG_HTTPD_ENABLE_SSL=y
