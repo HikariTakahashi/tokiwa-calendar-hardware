@@ -7,6 +7,8 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_pm.h"
+#include "esp_cpu.h"
 #include "nvs_flash.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -28,6 +30,26 @@ static EventGroupHandle_t wifi_event_group;
 // Buzzer on single pin
 static const gpio_num_t BUZZER_PIN = GPIO_NUM_2;
 static TaskHandle_t buzzer_task_handle = NULL;
+
+// Power management initialization for thermal optimization
+static void init_power_management(void) {
+    ESP_LOGI(TAG, "Initializing power management for thermal optimization...");
+    
+    // Configure CPU frequency scaling for heat reduction
+    esp_pm_config_t pm_config = {
+        .max_freq_mhz = 80,     // 最大80MHz（デフォルト160MHzから削減）
+        .min_freq_mhz = 10,     // 最小10MHz（アイドル時）
+        .light_sleep_enable = true  // ライトスリープ有効
+    };
+    
+    esp_err_t ret = esp_pm_configure(&pm_config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Power management configured: Max=%dMHz, Min=%dMHz, Light sleep enabled", 
+                 pm_config.max_freq_mhz, pm_config.min_freq_mhz);
+    } else {
+        ESP_LOGW(TAG, "Power management configuration failed: %s", esp_err_to_name(ret));
+    }
+}
 
 // Tone generation task: generates ~1kHz square wave on buzzer pin
 void buzzer_task(void* arg) {
@@ -53,6 +75,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // Subscribe to buzzer control topic
         msg_id = esp_mqtt_client_subscribe(client, "buzzer/control", 0);
         ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+        
+        // Optimize power after successful connection (thermal management)
+        ESP_LOGI(TAG, "Optimizing power settings after MQTT connection...");
+        esp_wifi_set_ps(WIFI_PS_MAX_MODEM);  // より強力な電力節約モード
+        esp_wifi_set_max_tx_power(44);       // さらに送信電力を下げる (11dBm)
+        
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -183,15 +211,29 @@ static void mqtt_app_start(void) {
 // WiFi event handler for STA mode
 static void wifi_event_handler_sta(void* arg, esp_event_base_t event_base,
                                    int32_t event_id, void* event_data) {
+    static int retry_count = 0;
+    const int MAX_RETRIES = 3;
+    
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "WiFi station started, connecting...");
+        retry_count = 0;
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
-        ESP_LOGI(TAG, "WiFi disconnected, reason: %d, retrying...", event->reason);
-        esp_wifi_connect();
+        ESP_LOGI(TAG, "WiFi disconnected, reason: %d", event->reason);
+        
+        if (retry_count < MAX_RETRIES) {
+            retry_count++;
+            ESP_LOGI(TAG, "Retrying WiFi connection (%d/%d) in 5 seconds...", retry_count, MAX_RETRIES);
+            vTaskDelay(5000 / portTICK_PERIOD_MS); // Wait 5 seconds before retry
+            esp_wifi_connect();
+        } else {
+            ESP_LOGE(TAG, "Max WiFi retries reached. Restarting...");
+            esp_restart();
+        }
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        retry_count = 0; // Reset retry count on successful connection
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "WiFi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "Gateway: " IPSTR, IP2STR(&event->ip_info.gw));
@@ -235,10 +277,41 @@ static void wifi_init_sta_mqtt(void) {
     strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
     strcpy((char*)wifi_config.sta.password, WIFI_PASSWORD);
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    // Add connection stability settings
+    wifi_config.sta.pmf_cfg.capable = true;
+    wifi_config.sta.pmf_cfg.required = false;
+    wifi_config.sta.scan_method = WIFI_FAST_SCAN;
+    wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    wifi_config.sta.threshold.rssi = -127;
+    wifi_config.sta.failure_retry_cnt = 10;  // 再試行回数を増加
+    wifi_config.sta.listen_interval = 1;     // ビーコン受信間隔を最短に
     
     ESP_LOGI(TAG, "Setting WiFi configuration...");
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    
+    // Power management optimization for heat reduction
+    ESP_LOGI(TAG, "Optimizing WiFi power settings for thermal management...");
+    
+    // Use minimum power save mode instead of completely disabling it
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));  // 最小電力管理
+    
+    // Reduce transmission power to lower heat generation (52 = 13dBm instead of 78 = 19.5dBm)
+    esp_wifi_set_max_tx_power(52);  // 送信電力を下げて発熱抑制
+    
+    // Set moderate inactive timeout
+    esp_wifi_set_inactive_time(WIFI_IF_STA, 30);  // 30秒でバランス調整
+    
+    // Set country configuration for better signal handling
+    wifi_country_t country_config = {
+        .cc = "JP",
+        .schan = 1,
+        .nchan = 14,
+        .max_tx_power = 20,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_country(&country_config));
+    
     ESP_ERROR_CHECK(esp_wifi_start());
     
     ESP_LOGI(TAG, "WiFi initialization completed. Starting connection...");
@@ -247,6 +320,9 @@ static void wifi_init_sta_mqtt(void) {
 extern "C" void app_main(void) {
     // NVSストレージを初期化
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    // 電力管理初期化（発熱対策）
+    init_power_management();
 
     // GPIOを初期化（ブザー）
     gpio_config_t io_conf = {};

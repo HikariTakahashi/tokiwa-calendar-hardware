@@ -7,7 +7,7 @@
 // MQTT Broker Configuration - 本番環境用
 // 実際の値は.envファイルで設定
 #ifndef MQTT_BROKER_HOST
-#define MQTT_BROKER_HOST           "your-emqx-host.emqxsl.com"  // .envで上書き
+#define MQTT_BROKER_HOST           "h611fd60.ala.asia-southeast1.emqxsl.com"  // .envで上書き
 #endif
 
 #ifndef MQTT_BROKER_PORT
@@ -15,11 +15,11 @@
 #endif
 
 #ifndef MQTT_USERNAME
-#define MQTT_USERNAME              "production_user"           // .envで上書き
+#define MQTT_USERNAME              "test_esp32"               // .envで上書き
 #endif
 
 #ifndef MQTT_PASSWORD
-#define MQTT_PASSWORD              "secure_password"           // .envで上書き
+#define MQTT_PASSWORD              "test123"                  // .envで上書き
 #endif
 
 // Device Configuration
@@ -39,11 +39,11 @@
 // WiFi Credentials - 本番環境用
 // 実際の値は.envファイルで設定
 #ifndef WIFI_SSID
-#define WIFI_SSID                  "production_wifi"          // .envで上書き
+#define WIFI_SSID                  "TP-Link_AE1C"             // .envで上書き
 #endif
 
 #ifndef WIFI_PASSWORD  
-#define WIFI_PASSWORD              "secure_wifi_password"     // .envで上書き
+#define WIFI_PASSWORD              "bell0809"                 // .envで上書き
 #endif
 
 // 自動WiFi接続を有効にする場合は1、APモードを強制する場合は0
