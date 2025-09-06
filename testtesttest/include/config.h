@@ -39,11 +39,11 @@
 // WiFi Credentials - 本番環境用
 // 実際の値は.envファイルで設定
 #ifndef WIFI_SSID
-#define WIFI_SSID                  "TP-Link_AE1C"             // .envで上書き
+#define WIFI_SSID                  "Haya"                     // .envで上書き
 #endif
 
 #ifndef WIFI_PASSWORD  
-#define WIFI_PASSWORD              "bell0809"                 // .envで上書き
+#define WIFI_PASSWORD              "6f6tfczesdr0n"             // .envで上書き
 #endif
 
 // 自動WiFi接続を有効にする場合は1、APモードを強制する場合は0

@@ -21,7 +21,14 @@ def load_env_vars():
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
-                    env_vars[key.strip()] = value.strip()
+                    key = key.strip()
+                    value = value.strip()
+                    # 引用符を削除
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    env_vars[key] = value
     else:
         print("Warning: .env file not found. Using default values.")
     
