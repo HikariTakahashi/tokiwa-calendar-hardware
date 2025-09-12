@@ -22,6 +22,7 @@
 #include "mqtt_client.h"
 #include "esp_crt_bundle.h"
 #include "config.h"
+#include "driver/i2c.h"
 
 // ROM delay function (provided in ROM)
 extern "C" void ets_delay_us(uint32_t us);
@@ -71,12 +72,12 @@ static rmt_encoder_handle_t led_encoder = NULL;
 static TaskHandle_t led_task_handle = NULL;
 static bool led_is_on = false;
 
-// NJL7302L-F3 Light Sensor Configuration  
-static const gpio_num_t LIGHT_SENSOR_PIN = GPIO_NUM_4;  // GPIO4 for light sensor
-static const adc_channel_t LIGHT_SENSOR_CHANNEL = ADC_CHANNEL_4;  // GPIO4 = ADC1_CH4
+// NJL7302L-F3 Light Sensor Configuration (GPIO3に変更)
+static const gpio_num_t LIGHT_SENSOR_PIN = GPIO_NUM_3;  // GPIO3 for light sensor (moved from GPIO4)
+static const adc_channel_t LIGHT_SENSOR_CHANNEL = ADC_CHANNEL_3;  // GPIO3 = ADC1_CH3
 static const adc_unit_t LIGHT_SENSOR_UNIT = ADC_UNIT_1;
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
-static adc_cali_handle_t adc1_cali_chan4_handle = NULL;
+static adc_cali_handle_t adc1_cali_chan3_handle = NULL;
 static bool adc_calibration_enable = false;
 
 // Light sensor thresholds and variables
@@ -99,6 +100,35 @@ static const gpio_num_t BUZZER_PIN = GPIO_NUM_1;
 #define BUZZER_PWM_CHANNEL  LEDC_CHANNEL_2
 #define BUZZER_FREQUENCY    4000  // 4kHz for clearer buzzer tone (more audible)
 #define BUZZER_RESOLUTION   LEDC_TIMER_8_BIT
+
+// OLED Display Configuration for 0.91" SSD1306
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 32
+#define OLED_ADDRESS 0x3C // I2C address for 0.91" OLED
+#define I2C_SDA_PIN GPIO_NUM_23  // GPIO23 = SDA
+#define I2C_SCL_PIN GPIO_NUM_22  // GPIO22 = SCL
+#define I2C_MASTER_NUM I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ 400000 // I2C frequency 400kHz
+
+// SSD1306 Commands
+#define SSD1306_DISPLAYOFF 0xAE
+#define SSD1306_DISPLAYON 0xAF
+#define SSD1306_SETDISPLAYCLOCKDIV 0xD5
+#define SSD1306_SETMULTIPLEX 0xA8
+#define SSD1306_SETDISPLAYOFFSET 0xD3
+#define SSD1306_SETSTARTLINE 0x40
+#define SSD1306_CHARGEPUMP 0x8D
+#define SSD1306_MEMORYMODE 0x20
+#define SSD1306_SEGREMAP 0xA0
+#define SSD1306_COMSCANDEC 0xC8
+#define SSD1306_SETCOMPINS 0xDA
+#define SSD1306_SETCONTRAST 0x81
+#define SSD1306_SETPRECHARGE 0xD9
+#define SSD1306_SETVCOMDETECT 0xDB
+#define SSD1306_NORMALDISPLAY 0xA6
+
+// OLED task handle
+static TaskHandle_t oled_display_task_handle = NULL;
 // GP1UXC41QS IR Receiver Configuration
 static const gpio_num_t IR_RECEIVER_PIN = GPIO_NUM_8;  // GP1UXC41QS connected to GPIO8
 static const gpio_num_t IR_TRANSMITTER_PIN = GPIO_NUM_7;  // IR LED connected to GPIO7
@@ -307,7 +337,7 @@ static esp_err_t init_adc_light_sensor(void) {
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    ret = adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_chan4_handle);
+    ret = adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_chan3_handle);
     if (ret == ESP_OK) {
         adc_calibration_enable = true;
         ESP_LOGI(TAG, "ADC calibration enabled");
@@ -328,8 +358,8 @@ static esp_err_t read_light_sensor(int *raw_value, int *voltage_mv) {
         return ret;
     }
 
-    if (adc_calibration_enable && adc1_cali_chan4_handle) {
-        ret = adc_cali_raw_to_voltage(adc1_cali_chan4_handle, *raw_value, voltage_mv);
+    if (adc_calibration_enable && adc1_cali_chan3_handle) {
+        ret = adc_cali_raw_to_voltage(adc1_cali_chan3_handle, *raw_value, voltage_mv);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to convert raw to voltage: %s", esp_err_to_name(ret));
             return ret;
@@ -544,6 +574,175 @@ static void play_reminder_buzzer(void) {
     vTaskDelay(pdMS_TO_TICKS(3000)); // 3 seconds
     set_buzzer(false);
     ESP_LOGI(TAG, "Reminder buzzer completed");
+}
+
+// Initialize OLED display
+static esp_err_t init_oled(void) {
+    ESP_LOGI(TAG, "Initializing OLED display (0.91 inch SSD1306)...");
+    
+    // I2C configuration
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+    };
+    conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
+    
+    esp_err_t ret = i2c_param_config(I2C_MASTER_NUM, &conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ret = i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C driver install failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Initialize SSD1306 OLED
+    uint8_t init_cmds[] = {
+        SSD1306_DISPLAYOFF,
+        SSD1306_SETDISPLAYCLOCKDIV, 0x80,
+        SSD1306_SETMULTIPLEX, OLED_HEIGHT - 1,
+        SSD1306_SETDISPLAYOFFSET, 0x00,
+        SSD1306_SETSTARTLINE | 0x00,
+        SSD1306_CHARGEPUMP, 0x14,
+        SSD1306_MEMORYMODE, 0x00,
+        SSD1306_SEGREMAP | 0x01,
+        SSD1306_COMSCANDEC,
+        SSD1306_SETCOMPINS, 0x02,
+        SSD1306_SETCONTRAST, 0x8F,
+        SSD1306_SETPRECHARGE, 0xF1,
+        SSD1306_SETVCOMDETECT, 0x40,
+        SSD1306_NORMALDISPLAY,
+        SSD1306_DISPLAYON
+    };
+    
+    // Send initialization commands
+    for (int i = 0; i < sizeof(init_cmds); i++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (OLED_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_write_byte(cmd, 0x00, true);  // Command mode
+        i2c_master_write_byte(cmd, init_cmds[i], true);
+        i2c_master_stop(cmd);
+        ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+        i2c_cmd_link_delete(cmd);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "SSD1306 init command %d failed: %s", i, esp_err_to_name(ret));
+            return ret;
+        }
+    }
+    
+    // Clear display
+    uint8_t clear_buf[OLED_WIDTH * OLED_HEIGHT / 8] = {0};
+    
+    // Set column address
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true);  // Command mode
+    i2c_master_write_byte(cmd, 0x21, true);  // Column address
+    i2c_master_write_byte(cmd, 0x00, true);  // Start column
+    i2c_master_write_byte(cmd, OLED_WIDTH - 1, true);  // End column
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    
+    // Set page address
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true);  // Command mode
+    i2c_master_write_byte(cmd, 0x22, true);  // Page address
+    i2c_master_write_byte(cmd, 0x00, true);  // Start page
+    i2c_master_write_byte(cmd, (OLED_HEIGHT / 8) - 1, true);  // End page
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    
+    // Send clear data
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x40, true);  // Data mode
+    i2c_master_write(cmd, clear_buf, sizeof(clear_buf), true);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    
+    ESP_LOGI(TAG, "OLED display initialized successfully");
+    return ESP_OK;
+}
+
+// Simple function to display text on OLED
+static esp_err_t oled_display_text(const char* text) {
+    // This is a simplified version - just shows that OLED is working
+    // For now, we'll just turn on all pixels to show it's working
+    uint8_t test_pattern[OLED_WIDTH * OLED_HEIGHT / 8];
+    
+    // Create a simple pattern to verify display is working
+    for (int i = 0; i < sizeof(test_pattern); i++) {
+        if (i < 64) {
+            test_pattern[i] = 0xFF; // Top half bright
+        } else {
+            test_pattern[i] = 0x00; // Bottom half dark
+        }
+    }
+    
+    // Set addressing
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true);  // Command mode
+    i2c_master_write_byte(cmd, 0x21, true);  // Column address
+    i2c_master_write_byte(cmd, 0x00, true);  // Start column
+    i2c_master_write_byte(cmd, OLED_WIDTH - 1, true);  // End column
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true);  // Command mode
+    i2c_master_write_byte(cmd, 0x22, true);  // Page address
+    i2c_master_write_byte(cmd, 0x00, true);  // Start page
+    i2c_master_write_byte(cmd, (OLED_HEIGHT / 8) - 1, true);  // End page
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    
+    // Send test pattern
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x40, true);  // Data mode
+    i2c_master_write(cmd, test_pattern, sizeof(test_pattern), true);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    
+    return ret;
+}
+
+// OLED display task - continuously display test text
+static void oled_display_task(void *arg) {
+    ESP_LOGI(TAG, "OLED display task started");
+    
+    while (1) {
+        // Display test pattern
+        esp_err_t ret = oled_display_text("TEST");
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to update OLED display: %s", esp_err_to_name(ret));
+        }
+        
+        // Update every 2 seconds
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
 }
 
 // IR receive task (simplified for ESP32-C6 using GPIO interrupts)
@@ -999,6 +1198,13 @@ extern "C" void app_main(void) {
         return;
     }
 
+    // OLED Display初期化
+    ret = init_oled();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize OLED display: %s", esp_err_to_name(ret));
+        return;
+    }
+
     // 初期状態でLEDを消灯
     rgb_color_t off_color = {.red = 0, .green = 0, .blue = 0};
     set_led_color(off_color);
@@ -1009,12 +1215,16 @@ extern "C" void app_main(void) {
     // IR受信監視タスクを開始
     xTaskCreate(ir_receive_task, "ir_receive_task", 4096, ir_receive_queue, 5, NULL);
 
+    // OLED表示タスクを開始
+    xTaskCreate(oled_display_task, "oled_display_task", 4096, NULL, 5, &oled_display_task_handle);
+
     ESP_LOGI(TAG, "ESP32-C6 IoT Controller started with:");
     ESP_LOGI(TAG, "- PL9823-F8 RGB LED on GPIO%d", LED_PIN);
     ESP_LOGI(TAG, "- NJL7302L-F3 Light Sensor on GPIO%d", LIGHT_SENSOR_PIN);
     ESP_LOGI(TAG, "- IR LED Transmitter on GPIO%d", IR_LED_PIN);
     ESP_LOGI(TAG, "- GP1UXC41QS IR Receiver on GPIO%d", IR_RECEIVER_PIN);
     ESP_LOGI(TAG, "- Buzzer on GPIO%d (MQTT reminder alerts)", BUZZER_PIN);
+    ESP_LOGI(TAG, "- OLED Display 0.91\" SSD1306 - SDA:GPIO%d, SCL:GPIO%d", I2C_SDA_PIN, I2C_SCL_PIN);
     ESP_LOGI(TAG, "Connecting to WiFi: %s", WIFI_SSID);
     
     // WiFi初期化してMQTT接続
