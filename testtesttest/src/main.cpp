@@ -15,6 +15,7 @@
 #include "lwip/sys.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
+#include "driver/ledc.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -83,10 +84,21 @@ static int light_raw_value = 0;
 static int light_voltage_mv = 0;
 static TaskHandle_t light_sensor_task_handle = NULL;
 
+// Buzzer task handle
+static TaskHandle_t buzzer_task_handle = NULL;
+
 // IR LED Configuration for GPIO7 (Safe testing)
 static const gpio_num_t IR_LED_PIN = GPIO_NUM_7;
 #define IR_LED_PWM_TIMER    LEDC_TIMER_1
 #define IR_LED_PWM_MODE     LEDC_LOW_SPEED_MODE
+
+// Buzzer Configuration for GPIO1
+static const gpio_num_t BUZZER_PIN = GPIO_NUM_1;
+#define BUZZER_PWM_TIMER    LEDC_TIMER_2
+#define BUZZER_PWM_MODE     LEDC_LOW_SPEED_MODE
+#define BUZZER_PWM_CHANNEL  LEDC_CHANNEL_2
+#define BUZZER_FREQUENCY    4000  // 4kHz for clearer buzzer tone (more audible)
+#define BUZZER_RESOLUTION   LEDC_TIMER_8_BIT
 // GP1UXC41QS IR Receiver Configuration
 static const gpio_num_t IR_RECEIVER_PIN = GPIO_NUM_8;  // GP1UXC41QS connected to GPIO8
 static const gpio_num_t IR_TRANSMITTER_PIN = GPIO_NUM_7;  // IR LED connected to GPIO7
@@ -474,6 +486,66 @@ static esp_err_t init_ir_system(void) {
     return ESP_OK;
 }
 
+// Initialize buzzer PWM
+static esp_err_t init_buzzer(void) {
+    ESP_LOGI(TAG, "Initializing buzzer on GPIO%d...", BUZZER_PIN);
+    
+    // Configure LEDC timer
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = BUZZER_PWM_MODE,
+        .duty_resolution = BUZZER_RESOLUTION,
+        .timer_num = BUZZER_PWM_TIMER,
+        .freq_hz = BUZZER_FREQUENCY,
+        .clk_cfg = LEDC_AUTO_CLK,
+        .deconfigure = false
+    };
+    esp_err_t ret = ledc_timer_config(&ledc_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure LEDC timer for buzzer: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Configure LEDC channel
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num = BUZZER_PIN,
+        .speed_mode = BUZZER_PWM_MODE,
+        .channel = BUZZER_PWM_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = BUZZER_PWM_TIMER,
+        .duty = 0, // Start with buzzer off
+        .hpoint = 0,
+        .flags = {
+            .output_invert = 0
+        }
+    };
+    ret = ledc_channel_config(&ledc_channel);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure LEDC channel for buzzer: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Buzzer initialized successfully on GPIO%d", BUZZER_PIN);
+    return ESP_OK;
+}
+
+// Turn buzzer on/off
+static void set_buzzer(bool on) {
+    uint32_t duty = on ? 128 : 0; // 50% duty cycle (128 out of 255 for 8-bit resolution)
+    ledc_set_duty(BUZZER_PWM_MODE, BUZZER_PWM_CHANNEL, duty);
+    ledc_update_duty(BUZZER_PWM_MODE, BUZZER_PWM_CHANNEL);
+    ESP_LOGI(TAG, "Buzzer set to %s (duty: %lu)", on ? "ON" : "OFF", duty);
+}
+
+// Play startup buzzer sequence
+// Play reminder buzzer for 3 seconds
+static void play_reminder_buzzer(void) {
+    ESP_LOGI(TAG, "Playing reminder buzzer (3 seconds)...");
+    set_buzzer(true);
+    vTaskDelay(pdMS_TO_TICKS(3000)); // 3 seconds
+    set_buzzer(false);
+    ESP_LOGI(TAG, "Reminder buzzer completed");
+}
+
 // IR receive task (simplified for ESP32-C6 using GPIO interrupts)
 static void ir_receive_task(void *arg) {
     QueueHandle_t receive_queue = (QueueHandle_t)arg;
@@ -615,6 +687,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         msg_id = esp_mqtt_client_subscribe(client, "ir/test", 0);
         ESP_LOGI(TAG, "sent subscribe to ir/test, msg_id=%d", msg_id);
         
+        // Subscribe to calendar reminders topic
+        msg_id = esp_mqtt_client_subscribe(client, "calendar/test/reminders", 0);
+        ESP_LOGI(TAG, "sent subscribe to calendar/test/reminders, msg_id=%d", msg_id);
+        
         // Optimize power after successful connection (thermal management)
         ESP_LOGI(TAG, "Optimizing power settings after MQTT connection...");
         esp_wifi_set_ps(WIFI_PS_MAX_MODEM);  // より強力な電力節約モード
@@ -672,6 +748,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     ESP_LOGE(TAG, "Failed to send IR test signal: %s", esp_err_to_name(ret));
                 }
             }
+        }
+        // Handle calendar reminder messages
+        else if (strncmp(event->topic, "calendar/test/reminders", event->topic_len) == 0) {
+            ESP_LOGI(TAG, "MQTT: Calendar reminder received: %.*s", event->data_len, event->data);
+            // Play 3-second reminder buzzer
+            play_reminder_buzzer();
         }
         break;
     case MQTT_EVENT_ERROR:
@@ -910,6 +992,13 @@ extern "C" void app_main(void) {
         return;
     }
 
+    // Buzzer初期化
+    ret = init_buzzer();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize buzzer: %s", esp_err_to_name(ret));
+        return;
+    }
+
     // 初期状態でLEDを消灯
     rgb_color_t off_color = {.red = 0, .green = 0, .blue = 0};
     set_led_color(off_color);
@@ -925,6 +1014,7 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "- NJL7302L-F3 Light Sensor on GPIO%d", LIGHT_SENSOR_PIN);
     ESP_LOGI(TAG, "- IR LED Transmitter on GPIO%d", IR_LED_PIN);
     ESP_LOGI(TAG, "- GP1UXC41QS IR Receiver on GPIO%d", IR_RECEIVER_PIN);
+    ESP_LOGI(TAG, "- Buzzer on GPIO%d (MQTT reminder alerts)", BUZZER_PIN);
     ESP_LOGI(TAG, "Connecting to WiFi: %s", WIFI_SSID);
     
     // WiFi初期化してMQTT接続
